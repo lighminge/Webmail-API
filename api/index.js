@@ -12,6 +12,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- 伺服器健康檢查 API (GET) ---
+app.get('/', (req, res) => {
+    res.json({ status: "OK", message: "Webmail API 伺服器運作中！" });
+});
+
 // --- 寄信 API (SMTP) ---
 app.post('/api/send', async (req, res) => {
 const { user, pass, to, subject, text, smtpHost } = req.body;
