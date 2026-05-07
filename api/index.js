@@ -1,4 +1,3 @@
-// api/index.js
 const express = require('express');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
@@ -7,9 +6,16 @@ const simpleParser = require('mailparser').simpleParser;
 
 const app = express();
 
-// 允許跨網域呼叫，請將這行改成您的 GitHub Pages 網址以策安全
-// 測試期間可以先用 cors() 允許所有網域
-app.use(cors());
+// 完整的 CORS 設定
+app.use(cors({
+    origin: '*', // 允許所有網域
+    methods: ['GET', 'POST', 'OPTIONS'], // 允許的 HTTP 方法
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// 【關鍵修復】強制攔截並回覆 OPTIONS 預檢請求
+app.options('*', cors());
+
 app.use(express.json());
 
 // --- 伺服器健康檢查 API (GET) ---
