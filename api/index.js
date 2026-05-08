@@ -13,11 +13,12 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(express.json());
+// 增加 JSON 負載上限至 10MB，以容納附件資料
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！" }));
+app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！支援附件收發。" }));
 
-// --- 新增：查詢信箱總數量 (防卡死機制) ---
 app.post('/api/emails/count', async (req, res) => {
     const { user, pass, imapHost } = req.body;
     try {
@@ -29,24 +30,40 @@ app.post('/api/emails/count', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// --- 寄信 API ---
+// --- 寄信 API (全面支援附件) ---
 app.post('/api/send', async (req, res) => {
-    const { user, pass, to, subject, text, html, smtpHost } = req.body;
+    const { user, pass, to, subject, text, html, smtpHost, attachments } = req.body;
     try {
         let transporter = nodemailer.createTransport({
             host: smtpHost || 'smtp.gmail.com', port: 465, secure: true,
             auth: { user, pass }
         });
-        let info = await transporter.sendMail({
-            from: user, to, subject, text, html: html || text.replace(/\n/g, '<br>') 
-        });
+
+        let mailOptions = {
+            from: user, 
+            to, 
+            subject, 
+            text, 
+            html: html || text.replace(/\n/g, '<br>')
+        };
+
+        // 如果前端有傳送附件，則動態加入 mailOptions
+        if (attachments && Array.isArray(attachments)) {
+            mailOptions.attachments = attachments.map(att => ({
+                filename: att.filename,
+                content: att.content,
+                encoding: 'base64',
+                contentType: att.contentType
+            }));
+        }
+
+        let info = await transporter.sendMail(mailOptions);
         res.json({ success: true, messageId: info.messageId });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// --- 刪除信件 API ---
 app.post('/api/delete', async (req, res) => {
     const { user, pass, imapHost, uids } = req.body;
     if (!uids || !uids.length) return res.status(400).json({ success: false });
@@ -60,7 +77,6 @@ app.post('/api/delete', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// --- 標記已讀 API ---
 app.post('/api/mark-read', async (req, res) => {
     const { user, pass, imapHost, uid } = req.body;
     try {
@@ -72,7 +88,6 @@ app.post('/api/mark-read', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// --- 標記已回覆 API ---
 app.post('/api/mark-answered', async (req, res) => {
     const { user, pass, imapHost, uid } = req.body;
     try {
@@ -84,7 +99,6 @@ app.post('/api/mark-answered', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// --- 收信 API (極速分頁與附件解析版) ---
 app.post('/api/emails', async (req, res) => {
     const { user, pass, imapHost, page = 1, limit = 30 } = req.body;
     try {
@@ -97,7 +111,6 @@ app.post('/api/emails', async (req, res) => {
             return res.json({ success: true, emails: [], total: 0 });
         }
 
-        // 精準分頁演算法：只撈取要求的那一頁
         const end = totalMessages - (page - 1) * limit;
         const start = Math.max(1, end - limit + 1);
 
@@ -116,7 +129,6 @@ app.post('/api/emails', async (req, res) => {
             const parsed = await simpleParser("Imap-Id: "+id+"\r\n" + all.body);
             const senderEmail = parsed.from && parsed.from.value.length > 0 ? parsed.from.value[0].address : '未知寄件者';
 
-            // 解析並轉換附件 (容量保護機制：超過 3MB 放棄傳送，以免 Serverless Payload 崩潰)
             let attachments = [];
             if (parsed.attachments && parsed.attachments.length > 0) {
                 attachments = parsed.attachments.map(att => {
