@@ -49,7 +49,7 @@ app.post('/api/emails/count', async (req, res) => {
     }
 });
 
-// --- 寄信 API (修復記憶體崩潰：不再使用 Buffer，改用原生 base64 encoding) ---
+// --- 寄信 API (完美修復記憶體崩潰與 552-5.7.0 阻擋) ---
 app.post('/api/send', async (req, res) => {
     const { user, pass, to, subject, text, html, smtpHost, attachments } = req.body;
     try {
@@ -62,14 +62,14 @@ app.post('/api/send', async (req, res) => {
             from: user, to, subject, text, html: html || text.replace(/\n/g, '<br>')
         };
 
-        // 【重大修復】不再使用 Buffer.from，直接丟 base64 字串給 Nodemailer
-        // 這能節省大量記憶體，徹底解決 Vercel Serverless Function 回傳 500 的 OOM 當機問題
         if (attachments && Array.isArray(attachments)) {
             mailOptions.attachments = attachments.map(att => ({
-                filename: att.filename,
+                filename: att.filename || 'attachment',
+                // 直接使用 base64 string 配合 encoding，避免 Vercel OOM 記憶體耗盡
                 content: att.content,
                 encoding: 'base64',
-                contentType: att.contentType
+                // 加入安全的預設 contentType，防止 Gmail 掃毒引擎報錯 552-5.7.0
+                contentType: att.contentType || 'application/octet-stream'
             }));
         }
 
@@ -239,6 +239,7 @@ app.post('/api/emails', async (req, res) => {
 
 module.exports = app;
 
+// 突破 Vercel 預設的 1MB 傳輸限制，強制解鎖允許接收最大 10MB 的帶附件請求
 module.exports.config = {
     api: {
         bodyParser: {
