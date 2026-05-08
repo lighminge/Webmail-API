@@ -17,18 +17,38 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！支援極速分頁與附件。" }));
+app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！已啟用企業級連線管理。" }));
 
-// --- 查詢信箱總數量 ---
+// --- 共用 IMAP 連線設定 (解決 Gmail 憑證與超時問題) ---
+const getImapConfig = (user, pass, host) => ({
+    imap: {
+        user: user,
+        password: pass,
+        host: host || 'imap.gmail.com',
+        port: 993,
+        tls: true,
+        // 加入 SNI 伺服器名稱與憑證放行，防止 Gmail 阻擋
+        tlsOptions: { servername: host || 'imap.gmail.com', rejectUnauthorized: false },
+        authTimeout: 20000, // 延長驗證時間至 20 秒
+        connTimeout: 20000
+    }
+});
+
+// --- 查詢信箱總數量 (防連線佔用版) ---
 app.post('/api/emails/count', async (req, res) => {
     const { user, pass, imapHost } = req.body;
+    let connection;
     try {
-        const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
+        connection = await imaps.connect(getImapConfig(user, pass, imapHost));
         const box = await connection.openBox('INBOX');
         const total = box.messages.total;
-        connection.end();
         res.json({ success: true, total });
-    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+    } catch (error) { 
+        res.status(500).json({ success: false, error: error.message }); 
+    } finally {
+        // 【重要修復】無論成功或失敗，強制關閉連線，防止 Gmail 15個連線數爆滿
+        if (connection) connection.end();
+    }
 });
 
 // --- 寄信 API (支援附件) ---
@@ -61,63 +81,70 @@ app.post('/api/send', async (req, res) => {
 app.post('/api/delete', async (req, res) => {
     const { user, pass, imapHost, uids } = req.body;
     if (!uids || !uids.length) return res.status(400).json({ success: false });
+    let connection;
     try {
-        const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
+        connection = await imaps.connect(getImapConfig(user, pass, imapHost));
         await connection.openBox('INBOX');
         await connection.addFlags(uids, '\\Deleted');
         await connection.imap.expunge((err) => { if (err) throw err; });
-        connection.end();
         res.json({ success: true });
-    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+    } catch (error) { 
+        res.status(500).json({ success: false, error: error.message }); 
+    } finally {
+        if (connection) connection.end();
+    }
 });
 
 app.post('/api/mark-read', async (req, res) => {
     const { user, pass, imapHost, uid } = req.body;
+    let connection;
     try {
-        const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
+        connection = await imaps.connect(getImapConfig(user, pass, imapHost));
         await connection.openBox('INBOX');
         await connection.addFlags(uid, '\\Seen');
-        connection.end();
         res.json({ success: true });
-    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+    } catch (error) { 
+        res.status(500).json({ success: false, error: error.message }); 
+    } finally {
+        if (connection) connection.end();
+    }
 });
 
 app.post('/api/mark-answered', async (req, res) => {
     const { user, pass, imapHost, uid } = req.body;
+    let connection;
     try {
-        const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
+        connection = await imaps.connect(getImapConfig(user, pass, imapHost));
         await connection.openBox('INBOX');
         await connection.addFlags(uid, '\\Answered');
-        connection.end();
         res.json({ success: true });
-    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+    } catch (error) { 
+        res.status(500).json({ success: false, error: error.message }); 
+    } finally {
+        if (connection) connection.end();
+    }
 });
 
-// --- 收信 API (終極相容版：改用 IMAP 原生 FETCH 取得 UID，解決 Gmail 當機與 Yahoo 缺信問題) ---
+// --- 收信 API (終極安全版) ---
 app.post('/api/emails', async (req, res) => {
     const { user, pass, imapHost, page = 1, limit = 30 } = req.body;
+    let connection;
     try {
-        // 延長連線超時，確保網路波動時不會被 Vercel 切斷
-        const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 15000 } });
+        connection = await imaps.connect(getImapConfig(user, pass, imapHost));
         const box = await connection.openBox('INBOX');
         const totalMessages = box.messages.total;
 
         if (totalMessages === 0) {
-            connection.end();
             return res.json({ success: true, emails: [], total: 0 });
         }
 
-        // 精準計算要抓取的序列範圍 (Sequence Range)
         const end = totalMessages - (page - 1) * limit;
         const start = Math.max(1, end - limit + 1);
 
         if (end < 1) {
-            connection.end();
             return res.json({ success: true, emails: [], total: totalMessages });
         }
 
-        // 【終極解法】利用 IMAP 底層 FETCH 指令，直接命令伺服器交出這區間的所有 UID
-        // 這個做法完全繞過 SEARCH，保證 Gmail 不會報錯，Yahoo 也會乖乖交出 30 筆資料
         const targetUids = await new Promise((resolve, reject) => {
             const foundUids = [];
             const f = connection.imap.seq.fetch(`${start}:${end}`);
@@ -133,11 +160,9 @@ app.post('/api/emails', async (req, res) => {
         });
 
         if (targetUids.length === 0) {
-            connection.end();
             return res.json({ success: true, emails: [], total: totalMessages });
         }
 
-        // 拿到精準的 UID 後，才進行信件內文的完整下載
         const searchCriteria = [['UID', targetUids.join(',')]];
         const messages = await connection.search(searchCriteria, { bodies: ['HEADER', 'TEXT', ''], markSeen: false });
         let parsedEmails = [];
@@ -180,15 +205,15 @@ app.post('/api/emails', async (req, res) => {
                 attachments: attachments
             });
         }
-        connection.end();
         
-        // 將結果重新排列，讓最新信件在最上面
         parsedEmails.sort((a, b) => b.timestamp - a.timestamp);
         res.json({ success: true, emails: parsedEmails, total: totalMessages });
 
     } catch (error) { 
         console.error("Fetch Error:", error);
         res.status(500).json({ success: false, error: error.message }); 
+    } finally {
+        if (connection) connection.end();
     }
 });
 
