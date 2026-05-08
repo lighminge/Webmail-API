@@ -17,15 +17,16 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！支援附件與精準分頁。" }));
+app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！支援附件與極速分頁。" }));
 
-// --- 查詢信箱總數量 ---
+// --- 查詢信箱總數量 (極速版 0 毫秒) ---
 app.post('/api/emails/count', async (req, res) => {
     const { user, pass, imapHost } = req.body;
     try {
         const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
-        const allMessages = await connection.search(['ALL'], { attributes: ['UID'] });
-        const total = allMessages.length;
+        const box = await connection.openBox('INBOX');
+        // 直接讀取信箱的 metadata，不消耗任何搜尋時間
+        const total = box.messages.total;
         connection.end();
         res.json({ success: true, total });
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
@@ -93,7 +94,7 @@ app.post('/api/mark-answered', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// --- 收信 API (精準 UID 分頁版，解決 Gmail 抓取失敗問題) ---
+// --- 收信 API (修復了導致 Unexpected token < 的崩潰錯誤) ---
 app.post('/api/emails', async (req, res) => {
     const { user, pass, imapHost, page = 1, limit = 30 } = req.body;
     try {
@@ -122,8 +123,9 @@ app.post('/api/emails', async (req, res) => {
             return res.json({ success: true, emails: [], total: totalMessages });
         }
 
-        // 3. 只精準抓取目標 UID 的信件內文
-        const messages = await connection.search([['UID', targetUids]], { bodies: ['HEADER', 'TEXT', ''], markSeen: false });
+        // 3. 【重大修復】使用 .join(',') 將陣列轉為字串，防止 IMAP 模組崩潰！
+        const searchCriteria = [['UID', targetUids.join(',')]];
+        const messages = await connection.search(searchCriteria, { bodies: ['HEADER', 'TEXT', ''], markSeen: false });
         let parsedEmails = [];
 
         for (let item of messages) {
