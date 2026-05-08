@@ -114,4 +114,44 @@ app.post('/api/emails', async (req, res) => {
     }
 });
 
+// --- 刪除信件 API (IMAP 同步真實刪除) ---
+app.post('/api/delete', async (req, res) => {
+    const { user, pass, imapHost, uids } = req.body;
+    
+    if (!uids || !Array.isArray(uids) || uids.length === 0) {
+        return res.status(400).json({ success: false, error: "未提供信件 UID" });
+    }
+
+    const config = {
+        imap: {
+            user: user,
+            password: pass,
+            host: imapHost || 'imap.gmail.com',
+            port: 993,
+            tls: true,
+            authTimeout: 8000
+        }
+    };
+
+    try {
+        const connection = await imaps.connect(config);
+        await connection.openBox('INBOX');
+        
+        // 將指定的 UIDs 加上 \Deleted 標籤
+        await connection.addFlags(uids, '\\Deleted');
+        
+        // 執行 EXPUNGE 指令來真正清空被標記為刪除的信件
+        await connection.imap.expunge((err) => {
+            if (err) throw err;
+        });
+        
+        connection.end();
+        res.json({ success: true, message: `已刪除 ${uids.length} 封信件` });
+
+    } catch (error) {
+        console.error("IMAP Delete Error:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 module.exports = app;
