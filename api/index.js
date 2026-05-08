@@ -13,13 +13,13 @@ app.use((req, res, next) => {
     next();
 });
 
-// 增加 JSON 負載上限至 10MB，以容納附件資料
+// 增加 Express 的 JSON 負載上限至 10MB，以容納附件資料
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！已啟用企業級連線管理與安全抓取。" }));
+app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！已啟用大附件傳輸與極速分頁。" }));
 
-// --- 共用 IMAP 連線設定 (解決 Gmail 憑證與超時問題) ---
+// --- 共用 IMAP 連線設定 ---
 const getImapConfig = (user, pass, host) => ({
     imap: {
         user: user,
@@ -27,14 +27,13 @@ const getImapConfig = (user, pass, host) => ({
         host: host || 'imap.gmail.com',
         port: 993,
         tls: true,
-        // 加入 SNI 伺服器名稱與憑證放行，防止 Gmail 阻擋
         tlsOptions: { servername: host || 'imap.gmail.com', rejectUnauthorized: false },
-        authTimeout: 20000, // 延長驗證時間至 20 秒
+        authTimeout: 20000, 
         connTimeout: 20000
     }
 });
 
-// --- 查詢信箱總數量 (防連線佔用版) ---
+// --- 查詢信箱總數量 ---
 app.post('/api/emails/count', async (req, res) => {
     const { user, pass, imapHost } = req.body;
     let connection;
@@ -46,12 +45,11 @@ app.post('/api/emails/count', async (req, res) => {
     } catch (error) { 
         res.status(500).json({ success: false, error: error.message }); 
     } finally {
-        // 無論成功或失敗，強制關閉連線，防止 15個連線數爆滿
         if (connection) connection.end();
     }
 });
 
-// --- 寄信 API (支援附件) ---
+// --- 寄信 API (完美支援 Base64 大附件轉碼) ---
 app.post('/api/send', async (req, res) => {
     const { user, pass, to, subject, text, html, smtpHost, attachments } = req.body;
     try {
@@ -64,11 +62,11 @@ app.post('/api/send', async (req, res) => {
             from: user, to, subject, text, html: html || text.replace(/\n/g, '<br>')
         };
 
+        // 【重大修復】確保將前端傳來的 Base64 字串正確轉換為 Buffer，避免寄送失敗
         if (attachments && Array.isArray(attachments)) {
             mailOptions.attachments = attachments.map(att => ({
                 filename: att.filename,
-                content: att.content,
-                encoding: 'base64',
+                content: Buffer.from(att.content, 'base64'),
                 contentType: att.contentType
             }));
         }
@@ -125,7 +123,7 @@ app.post('/api/mark-answered', async (req, res) => {
     }
 });
 
-// --- 收信 API (終極安全版：完全繞過 node-imap 搜尋字串錯誤的 Bug) ---
+// --- 收信 API ---
 app.post('/api/emails', async (req, res) => {
     const { user, pass, imapHost, page = 1, limit = 30 } = req.body;
     let connection;
@@ -145,7 +143,6 @@ app.post('/api/emails', async (req, res) => {
             return res.json({ success: true, emails: [], total: totalMessages });
         }
 
-        // 先精準抓取該區段的所有 UID (100% 成功，因不需傳遞搜尋字串)
         const targetUids = await new Promise((resolve, reject) => {
             const foundUids = [];
             const f = connection.imap.seq.fetch(`${start}:${end}`);
@@ -164,9 +161,7 @@ app.post('/api/emails', async (req, res) => {
             return res.json({ success: true, emails: [], total: totalMessages });
         }
 
-        // 【重大修復點】不使用有 Bug 的 connection.search，改為手動使用純 UID 陣列執行底層 fetch
         const messages = await new Promise((resolve, reject) => {
-            // 直接以 targetUids (純數字陣列) 進行請求，完全避免引號解析錯誤
             const f = connection.imap.fetch(targetUids, { bodies: ['HEADER', 'TEXT', ''], markSeen: false });
             const msgs = [];
             f.on('message', (msg) => {
@@ -187,7 +182,6 @@ app.post('/api/emails', async (req, res) => {
 
         let parsedEmails = [];
 
-        // 依然使用原本穩定的 mailparser 解析出文字與附件
         for (let item of messages) {
             const all = item.parts.find(part => part.which === '');
             if (!all) continue;
@@ -239,3 +233,12 @@ app.post('/api/emails', async (req, res) => {
 });
 
 module.exports = app;
+
+// 【最核心關鍵】突破 Vercel 預設的 1MB 傳輸限制，強制解鎖允許接收最大 10MB 的帶附件請求
+module.exports.config = {
+    api: {
+        bodyParser: {
+            sizeLimit: '10mb',
+        },
+    },
+};
