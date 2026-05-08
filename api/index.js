@@ -13,7 +13,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// 增加 Express 的 JSON 負載上限至 10MB，以容納附件資料
+// 增加 Express 的 JSON 負載上限至 10MB
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
@@ -49,7 +49,7 @@ app.post('/api/emails/count', async (req, res) => {
     }
 });
 
-// --- 寄信 API (完美修復記憶體崩潰與 552-5.7.0 阻擋) ---
+// --- 寄信 API (完美修復 552-5.7.0 阻擋) ---
 app.post('/api/send', async (req, res) => {
     const { user, pass, to, subject, text, html, smtpHost, attachments } = req.body;
     try {
@@ -63,14 +63,21 @@ app.post('/api/send', async (req, res) => {
         };
 
         if (attachments && Array.isArray(attachments)) {
-            mailOptions.attachments = attachments.map(att => ({
-                filename: att.filename || 'attachment',
-                // 直接使用 base64 string 配合 encoding，避免 Vercel OOM 記憶體耗盡
-                content: att.content,
-                encoding: 'base64',
-                // 加入安全的預設 contentType，防止 Gmail 掃毒引擎報錯 552-5.7.0
-                contentType: att.contentType || 'application/octet-stream'
-            }));
+            mailOptions.attachments = attachments.map(att => {
+                let attachmentObj = {
+                    filename: att.filename || 'attachment',
+                    content: att.content,
+                    encoding: 'base64',
+                    contentDisposition: 'attachment' // 強制標示為附件，降低 Gmail 掃毒誤判
+                };
+                
+                // 【重大修復】不再強制塞入 application/octet-stream，讓 Nodemailer 利用檔名自動智慧判定真實格式，避免觸發 Gmail 防毒機制
+                if (att.contentType && att.contentType.trim() !== '') {
+                    attachmentObj.contentType = att.contentType;
+                }
+                
+                return attachmentObj;
+            });
         }
 
         let info = await transporter.sendMail(mailOptions);
@@ -239,7 +246,6 @@ app.post('/api/emails', async (req, res) => {
 
 module.exports = app;
 
-// 突破 Vercel 預設的 1MB 傳輸限制，強制解鎖允許接收最大 10MB 的帶附件請求
 module.exports.config = {
     api: {
         bodyParser: {
