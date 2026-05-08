@@ -94,37 +94,34 @@ app.post('/api/mark-answered', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// --- 收信 API (修復了導致 Unexpected token < 的崩潰錯誤) ---
+// --- 收信 API (終極修復版：使用 IMAP 原生序號查詢，解決 Gmail 超時崩潰問題) ---
 app.post('/api/emails', async (req, res) => {
     const { user, pass, imapHost, page = 1, limit = 30 } = req.body;
     try {
+        // 延長連線超時，避免網路波動
         const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 15000 } });
-        await connection.openBox('INBOX');
+        const box = await connection.openBox('INBOX');
         
-        // 1. 先抓取所有的 UID (非常輕量，不載入內文)
-        const allMessages = await connection.search(['ALL'], { attributes: ['UID'] });
-        const totalMessages = allMessages.length;
+        // 極速讀取總信件數量
+        const totalMessages = box.messages.total;
 
         if (totalMessages === 0) {
             connection.end();
             return res.json({ success: true, emails: [], total: 0 });
         }
 
-        // 2. 進行分頁切割，算出要抓取的目標 UID
-        allMessages.sort((a, b) => a.attributes.uid - b.attributes.uid); // 舊到新排序
-        const reversed = [...allMessages].reverse(); // 反轉為新到舊
-        const startIndex = (page - 1) * limit;
-        const endIndex = startIndex + limit;
-        const targetMsgs = reversed.slice(startIndex, endIndex);
-        const targetUids = targetMsgs.map(m => m.attributes.uid);
+        // 精準計算要抓取的序列範圍 (Sequence Range)
+        // 假設總共有 500 封，第 1 頁就是抓 471~500
+        const end = totalMessages - (page - 1) * limit;
+        const start = Math.max(1, end - limit + 1);
 
-        if (targetUids.length === 0) {
+        if (end < 1) {
             connection.end();
             return res.json({ success: true, emails: [], total: totalMessages });
         }
 
-        // 3. 【重大修復】使用 .join(',') 將陣列轉為字串，防止 IMAP 模組崩潰！
-        const searchCriteria = [['UID', targetUids.join(',')]];
+        // 絕對不使用 ['ALL']，而是直接使用 "471:500" 的格式進行查詢，秒速回傳！
+        const searchCriteria = [ `${start}:${end}` ];
         const messages = await connection.search(searchCriteria, { bodies: ['HEADER', 'TEXT', ''], markSeen: false });
         let parsedEmails = [];
 
@@ -167,6 +164,7 @@ app.post('/api/emails', async (req, res) => {
             });
         }
         connection.end();
+        // 將結果重新排列，讓最新信件在最上面
         parsedEmails.sort((a, b) => b.timestamp - a.timestamp);
         res.json({ success: true, emails: parsedEmails, total: totalMessages });
 
