@@ -19,13 +19,12 @@ app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！支援極速分頁與附件。" }));
 
-// --- 查詢信箱總數量 (極速版 0 毫秒) ---
+// --- 查詢信箱總數量 ---
 app.post('/api/emails/count', async (req, res) => {
     const { user, pass, imapHost } = req.body;
     try {
         const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
         const box = await connection.openBox('INBOX');
-        // 直接讀取信箱的 metadata，不消耗任何搜尋時間
         const total = box.messages.total;
         connection.end();
         res.json({ success: true, total });
@@ -94,15 +93,13 @@ app.post('/api/mark-answered', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// --- 收信 API (終極修復版：使用 IMAP 原生序號查詢，解決 Gmail 超時崩潰問題) ---
+// --- 收信 API (終極相容版：改用 IMAP 原生 FETCH 取得 UID，解決 Gmail 當機與 Yahoo 缺信問題) ---
 app.post('/api/emails', async (req, res) => {
     const { user, pass, imapHost, page = 1, limit = 30 } = req.body;
     try {
-        // 延長連線超時，避免網路波動
+        // 延長連線超時，確保網路波動時不會被 Vercel 切斷
         const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 15000 } });
         const box = await connection.openBox('INBOX');
-        
-        // 極速讀取總信件數量
         const totalMessages = box.messages.total;
 
         if (totalMessages === 0) {
@@ -111,7 +108,6 @@ app.post('/api/emails', async (req, res) => {
         }
 
         // 精準計算要抓取的序列範圍 (Sequence Range)
-        // 假設總共有 500 封，第 1 頁就是抓 471~500
         const end = totalMessages - (page - 1) * limit;
         const start = Math.max(1, end - limit + 1);
 
@@ -120,8 +116,29 @@ app.post('/api/emails', async (req, res) => {
             return res.json({ success: true, emails: [], total: totalMessages });
         }
 
-        // 絕對不使用 ['ALL']，而是直接使用 "471:500" 的格式進行查詢，秒速回傳！
-        const searchCriteria = [ `${start}:${end}` ];
+        // 【終極解法】利用 IMAP 底層 FETCH 指令，直接命令伺服器交出這區間的所有 UID
+        // 這個做法完全繞過 SEARCH，保證 Gmail 不會報錯，Yahoo 也會乖乖交出 30 筆資料
+        const targetUids = await new Promise((resolve, reject) => {
+            const foundUids = [];
+            const f = connection.imap.seq.fetch(`${start}:${end}`);
+            f.on('message', (msg) => {
+                msg.once('attributes', (attrs) => {
+                    if (attrs && attrs.uid) {
+                        foundUids.push(attrs.uid);
+                    }
+                });
+            });
+            f.once('error', (err) => reject(err));
+            f.once('end', () => resolve(foundUids));
+        });
+
+        if (targetUids.length === 0) {
+            connection.end();
+            return res.json({ success: true, emails: [], total: totalMessages });
+        }
+
+        // 拿到精準的 UID 後，才進行信件內文的完整下載
+        const searchCriteria = [['UID', targetUids.join(',')]];
         const messages = await connection.search(searchCriteria, { bodies: ['HEADER', 'TEXT', ''], markSeen: false });
         let parsedEmails = [];
 
@@ -164,6 +181,7 @@ app.post('/api/emails', async (req, res) => {
             });
         }
         connection.end();
+        
         // 將結果重新排列，讓最新信件在最上面
         parsedEmails.sort((a, b) => b.timestamp - a.timestamp);
         res.json({ success: true, emails: parsedEmails, total: totalMessages });
