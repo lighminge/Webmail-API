@@ -72,13 +72,24 @@ app.post('/api/mark-answered', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// --- 收信 API ---
+// --- 收信 API (極速優化版) ---
 app.post('/api/emails', async (req, res) => {
     const { user, pass, imapHost } = req.body;
     try {
         const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
-        await connection.openBox('INBOX');
-        const messages = await connection.search(['ALL'], { bodies: ['HEADER', 'TEXT', ''], markSeen: false, results: [{ limit: 15 }] });
+        const box = await connection.openBox('INBOX');
+        
+        // 【極速優化】直接計算總信件數，只精準抓取最後 30 封最新信件，不浪費時間掃描全庫
+        const totalMessages = box.messages.total;
+        if (totalMessages === 0) {
+            connection.end();
+            return res.json({ success: true, emails: [] });
+        }
+        
+        const fetchStart = Math.max(1, totalMessages - 29); // 取得最後 30 封
+        const searchCriteria = [ `${fetchStart}:*` ]; // 使用 Sequence Number 精準搜尋
+        
+        const messages = await connection.search(searchCriteria, { bodies: ['HEADER', 'TEXT', ''], markSeen: false });
         let parsedEmails = [];
 
         for (let item of messages) {
@@ -97,7 +108,7 @@ app.post('/api/emails', async (req, res) => {
                 bodySnippet: parsed.text ? parsed.text.substring(0, 50).replace(/\n/g, ' ') : '',
                 timestamp: parsed.date ? parsed.date.getTime() : Date.now(),
                 read: item.attributes.flags.includes('\\Seen'),
-                replied: item.attributes.flags.includes('\\Answered') // 取得是否已回信的標籤
+                replied: item.attributes.flags.includes('\\Answered')
             });
         }
         connection.end();
