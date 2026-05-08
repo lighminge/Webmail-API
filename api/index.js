@@ -17,7 +17,7 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！已啟用大附件傳輸與極速分頁。" }));
+app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！已啟用安全大附件傳輸與極速分頁。" }));
 
 // --- 共用 IMAP 連線設定 ---
 const getImapConfig = (user, pass, host) => ({
@@ -49,7 +49,7 @@ app.post('/api/emails/count', async (req, res) => {
     }
 });
 
-// --- 寄信 API (完美支援 Base64 大附件轉碼) ---
+// --- 寄信 API (修復記憶體崩潰：不再使用 Buffer，改用原生 base64 encoding) ---
 app.post('/api/send', async (req, res) => {
     const { user, pass, to, subject, text, html, smtpHost, attachments } = req.body;
     try {
@@ -62,18 +62,23 @@ app.post('/api/send', async (req, res) => {
             from: user, to, subject, text, html: html || text.replace(/\n/g, '<br>')
         };
 
-        // 【重大修復】確保將前端傳來的 Base64 字串正確轉換為 Buffer，避免寄送失敗
+        // 【重大修復】不再使用 Buffer.from，直接丟 base64 字串給 Nodemailer
+        // 這能節省大量記憶體，徹底解決 Vercel Serverless Function 回傳 500 的 OOM 當機問題
         if (attachments && Array.isArray(attachments)) {
             mailOptions.attachments = attachments.map(att => ({
                 filename: att.filename,
-                content: Buffer.from(att.content, 'base64'),
+                content: att.content,
+                encoding: 'base64',
                 contentType: att.contentType
             }));
         }
 
         let info = await transporter.sendMail(mailOptions);
         res.json({ success: true, messageId: info.messageId });
-    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+    } catch (error) { 
+        console.error("SMTP Send Error:", error);
+        res.status(500).json({ success: false, error: error.message }); 
+    }
 });
 
 app.post('/api/delete', async (req, res) => {
@@ -234,7 +239,6 @@ app.post('/api/emails', async (req, res) => {
 
 module.exports = app;
 
-// 【最核心關鍵】突破 Vercel 預設的 1MB 傳輸限制，強制解鎖允許接收最大 10MB 的帶附件請求
 module.exports.config = {
     api: {
         bodyParser: {
