@@ -17,20 +17,21 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！支援附件收發。" }));
+app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！支援附件與精準分頁。" }));
 
+// --- 查詢信箱總數量 ---
 app.post('/api/emails/count', async (req, res) => {
     const { user, pass, imapHost } = req.body;
     try {
         const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
-        const box = await connection.openBox('INBOX');
-        const total = box.messages.total;
+        const allMessages = await connection.search(['ALL'], { attributes: ['UID'] });
+        const total = allMessages.length;
         connection.end();
         res.json({ success: true, total });
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// --- 寄信 API (全面支援附件) ---
+// --- 寄信 API (支援附件) ---
 app.post('/api/send', async (req, res) => {
     const { user, pass, to, subject, text, html, smtpHost, attachments } = req.body;
     try {
@@ -40,14 +41,9 @@ app.post('/api/send', async (req, res) => {
         });
 
         let mailOptions = {
-            from: user, 
-            to, 
-            subject, 
-            text, 
-            html: html || text.replace(/\n/g, '<br>')
+            from: user, to, subject, text, html: html || text.replace(/\n/g, '<br>')
         };
 
-        // 如果前端有傳送附件，則動態加入 mailOptions
         if (attachments && Array.isArray(attachments)) {
             mailOptions.attachments = attachments.map(att => ({
                 filename: att.filename,
@@ -59,9 +55,7 @@ app.post('/api/send', async (req, res) => {
 
         let info = await transporter.sendMail(mailOptions);
         res.json({ success: true, messageId: info.messageId });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
 app.post('/api/delete', async (req, res) => {
@@ -99,49 +93,61 @@ app.post('/api/mark-answered', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
+// --- 收信 API (精準 UID 分頁版，解決 Gmail 抓取失敗問題) ---
 app.post('/api/emails', async (req, res) => {
     const { user, pass, imapHost, page = 1, limit = 30 } = req.body;
     try {
-        const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 10000 } });
-        const box = await connection.openBox('INBOX');
-        const totalMessages = box.messages.total;
+        const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 15000 } });
+        await connection.openBox('INBOX');
+        
+        // 1. 先抓取所有的 UID (非常輕量，不載入內文)
+        const allMessages = await connection.search(['ALL'], { attributes: ['UID'] });
+        const totalMessages = allMessages.length;
 
         if (totalMessages === 0) {
             connection.end();
             return res.json({ success: true, emails: [], total: 0 });
         }
 
-        const end = totalMessages - (page - 1) * limit;
-        const start = Math.max(1, end - limit + 1);
+        // 2. 進行分頁切割，算出要抓取的目標 UID
+        allMessages.sort((a, b) => a.attributes.uid - b.attributes.uid); // 舊到新排序
+        const reversed = [...allMessages].reverse(); // 反轉為新到舊
+        const startIndex = (page - 1) * limit;
+        const endIndex = startIndex + limit;
+        const targetMsgs = reversed.slice(startIndex, endIndex);
+        const targetUids = targetMsgs.map(m => m.attributes.uid);
 
-        if (end < 1) {
+        if (targetUids.length === 0) {
             connection.end();
             return res.json({ success: true, emails: [], total: totalMessages });
         }
 
-        const searchCriteria = [ `${start}:${end}` ];
-        const messages = await connection.search(searchCriteria, { bodies: ['HEADER', 'TEXT', ''], markSeen: false });
+        // 3. 只精準抓取目標 UID 的信件內文
+        const messages = await connection.search([['UID', targetUids]], { bodies: ['HEADER', 'TEXT', ''], markSeen: false });
         let parsedEmails = [];
 
         for (let item of messages) {
             const all = item.parts.find(part => part.which === '');
+            if (!all) continue;
+            
             const id = item.attributes.uid;
             const parsed = await simpleParser("Imap-Id: "+id+"\r\n" + all.body);
             const senderEmail = parsed.from && parsed.from.value.length > 0 ? parsed.from.value[0].address : '未知寄件者';
 
             let attachments = [];
             if (parsed.attachments && parsed.attachments.length > 0) {
-                attachments = parsed.attachments.map(att => {
+                for (let att of parsed.attachments) {
                     if (att.size > 3 * 1024 * 1024) {
-                        return { filename: att.filename, contentType: att.contentType, size: att.size, error: true };
+                        attachments.push({ filename: att.filename, contentType: att.contentType, size: att.size, error: true });
+                    } else if (att.content) {
+                        attachments.push({
+                            filename: att.filename,
+                            contentType: att.contentType,
+                            size: att.size,
+                            content: att.content.toString('base64')
+                        });
                     }
-                    return {
-                        filename: att.filename,
-                        contentType: att.contentType,
-                        size: att.size,
-                        content: att.content.toString('base64')
-                    };
-                });
+                }
             }
 
             parsedEmails.push({
@@ -163,6 +169,7 @@ app.post('/api/emails', async (req, res) => {
         res.json({ success: true, emails: parsedEmails, total: totalMessages });
 
     } catch (error) { 
+        console.error("Fetch Error:", error);
         res.status(500).json({ success: false, error: error.message }); 
     }
 });
