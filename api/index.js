@@ -17,22 +17,21 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！支援附件與極速分頁。" }));
+app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！支援極速分頁與附件。" }));
 
-// --- 查詢信箱總數量 (極速版 0 毫秒) ---
+// --- 查詢信箱總數量 ---
 app.post('/api/emails/count', async (req, res) => {
     const { user, pass, imapHost } = req.body;
     try {
         const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
         const box = await connection.openBox('INBOX');
-        // 直接讀取信箱的 metadata，不消耗任何搜尋時間
         const total = box.messages.total;
         connection.end();
         res.json({ success: true, total });
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// --- 寄信 API (支援附件) ---
+// --- 寄信 API (支援多重附件) ---
 app.post('/api/send', async (req, res) => {
     const { user, pass, to, subject, text, html, smtpHost, attachments } = req.body;
     try {
@@ -94,37 +93,30 @@ app.post('/api/mark-answered', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// --- 收信 API (修復了導致 Unexpected token < 的崩潰錯誤) ---
+// --- 收信 API (終極相容版：使用 IMAP 標準 Sequence Range，解決 Gmail/Yahoo 抓取失敗問題) ---
 app.post('/api/emails', async (req, res) => {
     const { user, pass, imapHost, page = 1, limit = 30 } = req.body;
     try {
         const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 15000 } });
-        await connection.openBox('INBOX');
-        
-        // 1. 先抓取所有的 UID (非常輕量，不載入內文)
-        const allMessages = await connection.search(['ALL'], { attributes: ['UID'] });
-        const totalMessages = allMessages.length;
+        const box = await connection.openBox('INBOX');
+        const totalMessages = box.messages.total;
 
         if (totalMessages === 0) {
             connection.end();
             return res.json({ success: true, emails: [], total: 0 });
         }
 
-        // 2. 進行分頁切割，算出要抓取的目標 UID
-        allMessages.sort((a, b) => a.attributes.uid - b.attributes.uid); // 舊到新排序
-        const reversed = [...allMessages].reverse(); // 反轉為新到舊
-        const startIndex = (page - 1) * limit;
-        const endIndex = startIndex + limit;
-        const targetMsgs = reversed.slice(startIndex, endIndex);
-        const targetUids = targetMsgs.map(m => m.attributes.uid);
+        // 精準計算要抓取的序列範圍 (Sequence Range)，例如 501:530
+        const end = totalMessages - (page - 1) * limit;
+        const start = Math.max(1, end - limit + 1);
 
-        if (targetUids.length === 0) {
+        if (end < 1) {
             connection.end();
             return res.json({ success: true, emails: [], total: totalMessages });
         }
 
-        // 3. 【重大修復】使用 .join(',') 將陣列轉為字串，防止 IMAP 模組崩潰！
-        const searchCriteria = [['UID', targetUids.join(',')]];
+        // 使用標準 IMAP 範圍指令，100% 相容所有信箱伺服器
+        const searchCriteria = [ `${start}:${end}` ];
         const messages = await connection.search(searchCriteria, { bodies: ['HEADER', 'TEXT', ''], markSeen: false });
         let parsedEmails = [];
 
@@ -132,7 +124,7 @@ app.post('/api/emails', async (req, res) => {
             const all = item.parts.find(part => part.which === '');
             if (!all) continue;
             
-            const id = item.attributes.uid;
+            const id = item.attributes.uid; // 保留真實 UID 給刪除或已讀使用
             const parsed = await simpleParser("Imap-Id: "+id+"\r\n" + all.body);
             const senderEmail = parsed.from && parsed.from.value.length > 0 ? parsed.from.value[0].address : '未知寄件者';
 
