@@ -17,9 +17,8 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！已啟用安全大附件傳輸與極速分頁。" }));
+app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！已支援未讀篩選與極速分頁。" }));
 
-// --- 共用 IMAP 連線設定 ---
 const getImapConfig = (user, pass, host) => ({
     imap: {
         user: user,
@@ -33,14 +32,22 @@ const getImapConfig = (user, pass, host) => ({
     }
 });
 
-// --- 查詢信箱總數量 ---
+// --- 查詢信箱總數量 (支援未讀篩選) ---
 app.post('/api/emails/count', async (req, res) => {
-    const { user, pass, imapHost } = req.body;
+    const { user, pass, imapHost, filter } = req.body;
     let connection;
     try {
         connection = await imaps.connect(getImapConfig(user, pass, imapHost));
         const box = await connection.openBox('INBOX');
-        const total = box.messages.total;
+        let total = 0;
+        
+        // 如果有傳入 filter='unread'，則計算未讀總數
+        if (filter === 'unread') {
+            const results = await connection.search(['UNSEEN'], { attributes: ['UID'] });
+            total = results.length;
+        } else {
+            total = box.messages.total;
+        }
         res.json({ success: true, total });
     } catch (error) { 
         res.status(500).json({ success: false, error: error.message }); 
@@ -49,7 +56,6 @@ app.post('/api/emails/count', async (req, res) => {
     }
 });
 
-// --- 寄信 API (完美修復 552-5.7.0 阻擋) ---
 app.post('/api/send', async (req, res) => {
     const { user, pass, to, subject, text, html, smtpHost, attachments } = req.body;
     try {
@@ -63,21 +69,12 @@ app.post('/api/send', async (req, res) => {
         };
 
         if (attachments && Array.isArray(attachments)) {
-            mailOptions.attachments = attachments.map(att => {
-                let attachmentObj = {
-                    filename: att.filename || 'attachment',
-                    content: att.content,
-                    encoding: 'base64',
-                    contentDisposition: 'attachment' // 強制標示為附件，降低 Gmail 掃毒誤判
-                };
-                
-                // 【重大修復】不再強制塞入 application/octet-stream，讓 Nodemailer 利用檔名自動智慧判定真實格式，避免觸發 Gmail 防毒機制
-                if (att.contentType && att.contentType.trim() !== '') {
-                    attachmentObj.contentType = att.contentType;
-                }
-                
-                return attachmentObj;
-            });
+            mailOptions.attachments = attachments.map(att => ({
+                filename: att.filename || 'attachment',
+                content: att.content,
+                encoding: 'base64',
+                contentType: att.contentType || 'application/octet-stream'
+            }));
         }
 
         let info = await transporter.sendMail(mailOptions);
@@ -135,39 +132,53 @@ app.post('/api/mark-answered', async (req, res) => {
     }
 });
 
-// --- 收信 API ---
+// --- 收信 API (支援未讀篩選) ---
 app.post('/api/emails', async (req, res) => {
-    const { user, pass, imapHost, page = 1, limit = 30 } = req.body;
+    const { user, pass, imapHost, page = 1, limit = 30, filter = 'all' } = req.body;
     let connection;
     try {
         connection = await imaps.connect(getImapConfig(user, pass, imapHost));
         const box = await connection.openBox('INBOX');
-        const totalMessages = box.messages.total;
+        
+        let targetUids = [];
+        let totalMessages = 0;
 
-        if (totalMessages === 0) {
-            return res.json({ success: true, emails: [], total: 0 });
-        }
+        // 如果選擇僅看未讀，透過 IMAP 的 UNSEEN 指令篩選
+        if (filter === 'unread') {
+            const allUnread = await connection.search(['UNSEEN'], { attributes: ['UID'] });
+            totalMessages = allUnread.length;
+            if (totalMessages === 0) {
+                return res.json({ success: true, emails: [], total: 0 });
+            }
+            
+            allUnread.sort((a, b) => a.attributes.uid - b.attributes.uid); // 排序以進行分頁
+            const reversed = [...allUnread].reverse();
+            
+            const startIndex = (page - 1) * limit;
+            const endIndex = startIndex + limit;
+            const targetMsgs = reversed.slice(startIndex, endIndex);
+            targetUids = targetMsgs.map(m => m.attributes.uid);
 
-        const end = totalMessages - (page - 1) * limit;
-        const start = Math.max(1, end - limit + 1);
+        } else {
+            // 預設讀取全部信件 (極速模式)
+            totalMessages = box.messages.total;
+            if (totalMessages === 0) return res.json({ success: true, emails: [], total: 0 });
 
-        if (end < 1) {
-            return res.json({ success: true, emails: [], total: totalMessages });
-        }
+            const end = totalMessages - (page - 1) * limit;
+            const start = Math.max(1, end - limit + 1);
 
-        const targetUids = await new Promise((resolve, reject) => {
-            const foundUids = [];
-            const f = connection.imap.seq.fetch(`${start}:${end}`);
-            f.on('message', (msg) => {
-                msg.once('attributes', (attrs) => {
-                    if (attrs && attrs.uid) {
-                        foundUids.push(attrs.uid);
-                    }
+            if (end < 1) return res.json({ success: true, emails: [], total: totalMessages });
+
+            targetUids = await new Promise((resolve, reject) => {
+                const foundUids = [];
+                const f = connection.imap.seq.fetch(`${start}:${end}`);
+                f.on('message', (msg) => {
+                    msg.once('attributes', (attrs) => { if (attrs && attrs.uid) foundUids.push(attrs.uid); });
                 });
+                f.once('error', (err) => reject(err));
+                f.once('end', () => resolve(foundUids));
             });
-            f.once('error', (err) => reject(err));
-            f.once('end', () => resolve(foundUids));
-        });
+        }
 
         if (targetUids.length === 0) {
             return res.json({ success: true, emails: [], total: totalMessages });
