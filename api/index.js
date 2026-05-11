@@ -13,129 +13,15 @@ app.use((req, res, next) => {
     next();
 });
 
-// 增加 Express 的 JSON 負載上限至 10MB
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(express.json());
 
-app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！已支援未讀篩選與極速分頁。" }));
-
-const getImapConfig = (user, pass, host) => ({
-    imap: {
-        user: user,
-        password: pass,
-        host: host || 'imap.gmail.com',
-        port: 993,
-        tls: true,
-        tlsOptions: { servername: host || 'imap.gmail.com', rejectUnauthorized: false },
-        authTimeout: 20000, 
-        connTimeout: 20000
-    }
-});
-
-// --- 查詢信箱總數量 (支援未讀篩選) ---
-app.post('/api/emails/count', async (req, res) => {
-    const { user, pass, imapHost, filter } = req.body;
-    let connection;
-    try {
-        connection = await imaps.connect(getImapConfig(user, pass, imapHost));
-        const box = await connection.openBox('INBOX');
-        let total = 0;
-        
-        // 如果有傳入 filter='unread'，則計算未讀總數
-        if (filter === 'unread') {
-            const results = await connection.search(['UNSEEN'], { attributes: ['UID'] });
-            total = results.length;
-        } else {
-            total = box.messages.total;
-        }
-        res.json({ success: true, total });
-    } catch (error) { 
-        res.status(500).json({ success: false, error: error.message }); 
-    } finally {
-        if (connection) connection.end();
-    }
-});
-
-app.post('/api/send', async (req, res) => {
-    const { user, pass, to, subject, text, html, smtpHost, attachments } = req.body;
-    try {
-        let transporter = nodemailer.createTransport({
-            host: smtpHost || 'smtp.gmail.com', port: 465, secure: true,
-            auth: { user, pass }
-        });
-
-        let mailOptions = {
-            from: user, to, subject, text, html: html || text.replace(/\n/g, '<br>')
-        };
-
-        if (attachments && Array.isArray(attachments)) {
-            mailOptions.attachments = attachments.map(att => ({
-                filename: att.filename || 'attachment',
-                content: att.content,
-                encoding: 'base64',
-                contentType: att.contentType || 'application/octet-stream'
-            }));
-        }
-
-        let info = await transporter.sendMail(mailOptions);
-        res.json({ success: true, messageId: info.messageId });
-    } catch (error) { 
-        console.error("SMTP Send Error:", error);
-        res.status(500).json({ success: false, error: error.message }); 
-    }
-});
-
-app.post('/api/delete', async (req, res) => {
-    const { user, pass, imapHost, uids } = req.body;
-    if (!uids || !uids.length) return res.status(400).json({ success: false });
-    let connection;
-    try {
-        connection = await imaps.connect(getImapConfig(user, pass, imapHost));
-        await connection.openBox('INBOX');
-        await connection.addFlags(uids, '\\Deleted');
-        await connection.imap.expunge((err) => { if (err) throw err; });
-        res.json({ success: true });
-    } catch (error) { 
-        res.status(500).json({ success: false, error: error.message }); 
-    } finally {
-        if (connection) connection.end();
-    }
-});
-
-app.post('/api/mark-read', async (req, res) => {
-    const { user, pass, imapHost, uid } = req.body;
-    let connection;
-    try {
-        connection = await imaps.connect(getImapConfig(user, pass, imapHost));
-        await connection.openBox('INBOX');
-        await connection.addFlags(uid, '\\Seen');
-        res.json({ success: true });
-    } catch (error) { 
-        res.status(500).json({ success: false, error: error.message }); 
-    } finally {
-        if (connection) connection.end();
-    }
-});
-
-app.post('/api/mark-answered', async (req, res) => {
-    const { user, pass, imapHost, uid } = req.body;
-    let connection;
-    try {
-        connection = await imaps.connect(getImapConfig(user, pass, imapHost));
-        await connection.openBox('INBOX');
-        await connection.addFlags(uid, '\\Answered');
-        res.json({ success: true });
-    } catch (error) { 
-        res.status(500).json({ success: false, error: error.message }); 
-    } finally {
-        if (connection) connection.end();
-    }
-});
+app.get('/', (req, res) => res.json({ status: "OK", message: "Webmail API 伺服器運作中！" }));
 
 // --- reCAPTCHA v3 後端真實驗證 API ---
 app.post('/api/verify-recaptcha', async (req, res) => {
     const { token, action } = req.body;
-    // 您的專屬 Google reCAPTCHA v3 秘鑰 (請保密，勿放於前端)
+    
+    // 您的專屬 Google reCAPTCHA v3 秘鑰
     const secretKey = '6LfZK-QsAAAAAMHUdBQggSvq2QkM7bqhHzbwcPT-';
 
     if (!token) {
@@ -165,103 +51,76 @@ app.post('/api/verify-recaptcha', async (req, res) => {
     }
 });
 
-// --- 收信 API (支援未讀篩選) ---
-app.post('/api/emails', async (req, res) => {
-    const { user, pass, imapHost, page = 1, limit = 30, filter = 'all' } = req.body;
-    let connection;
+// --- 寄信 API ---
+app.post('/api/send', async (req, res) => {
+    const { user, pass, to, subject, text, html, smtpHost } = req.body;
     try {
-        connection = await imaps.connect(getImapConfig(user, pass, imapHost));
-        const box = await connection.openBox('INBOX');
-        
-        let targetUids = [];
-        let totalMessages = 0;
-
-        // 如果選擇僅看未讀，透過 IMAP 的 UNSEEN 指令篩選
-        if (filter === 'unread') {
-            const allUnread = await connection.search(['UNSEEN'], { attributes: ['UID'] });
-            totalMessages = allUnread.length;
-            if (totalMessages === 0) {
-                return res.json({ success: true, emails: [], total: 0 });
-            }
-            
-            allUnread.sort((a, b) => a.attributes.uid - b.attributes.uid); // 排序以進行分頁
-            const reversed = [...allUnread].reverse();
-            
-            const startIndex = (page - 1) * limit;
-            const endIndex = startIndex + limit;
-            const targetMsgs = reversed.slice(startIndex, endIndex);
-            targetUids = targetMsgs.map(m => m.attributes.uid);
-
-        } else {
-            // 預設讀取全部信件 (極速模式)
-            totalMessages = box.messages.total;
-            if (totalMessages === 0) return res.json({ success: true, emails: [], total: 0 });
-
-            const end = totalMessages - (page - 1) * limit;
-            const start = Math.max(1, end - limit + 1);
-
-            if (end < 1) return res.json({ success: true, emails: [], total: totalMessages });
-
-            targetUids = await new Promise((resolve, reject) => {
-                const foundUids = [];
-                const f = connection.imap.seq.fetch(`${start}:${end}`);
-                f.on('message', (msg) => {
-                    msg.once('attributes', (attrs) => { if (attrs && attrs.uid) foundUids.push(attrs.uid); });
-                });
-                f.once('error', (err) => reject(err));
-                f.once('end', () => resolve(foundUids));
-            });
-        }
-
-        if (targetUids.length === 0) {
-            return res.json({ success: true, emails: [], total: totalMessages });
-        }
-
-        const messages = await new Promise((resolve, reject) => {
-            const f = connection.imap.fetch(targetUids, { bodies: ['HEADER', 'TEXT', ''], markSeen: false });
-            const msgs = [];
-            f.on('message', (msg) => {
-                const message = { attributes: null, parts: [] };
-                msg.on('body', (stream, info) => {
-                    let buffer = [];
-                    stream.on('data', (chunk) => buffer.push(chunk));
-                    stream.once('end', () => { 
-                        message.parts.push({ which: info.which, body: Buffer.concat(buffer).toString('utf8') }); 
-                    });
-                });
-                msg.once('attributes', (attrs) => { message.attributes = attrs; });
-                msg.once('end', () => { msgs.push(message); });
-            });
-            f.once('error', (err) => reject(err));
-            f.once('end', () => resolve(msgs));
+        let transporter = nodemailer.createTransport({
+            host: smtpHost || 'smtp.gmail.com', port: 465, secure: true,
+            auth: { user, pass }
         });
+        let info = await transporter.sendMail({
+            from: user, to, subject, text, html: html || text.replace(/\n/g, '<br>') 
+        });
+        res.json({ success: true, messageId: info.messageId });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
 
+// --- 刪除信件 API ---
+app.post('/api/delete', async (req, res) => {
+    const { user, pass, imapHost, uids } = req.body;
+    if (!uids || !uids.length) return res.status(400).json({ success: false });
+    try {
+        const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
+        await connection.openBox('INBOX');
+        await connection.addFlags(uids, '\\Deleted');
+        await connection.imap.expunge((err) => { if (err) throw err; });
+        connection.end();
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+// --- 標記已讀 API ---
+app.post('/api/mark-read', async (req, res) => {
+    const { user, pass, imapHost, uid } = req.body;
+    try {
+        const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
+        await connection.openBox('INBOX');
+        await connection.addFlags(uid, '\\Seen');
+        connection.end();
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+// --- 標記已回覆 API ---
+app.post('/api/mark-answered', async (req, res) => {
+    const { user, pass, imapHost, uid } = req.body;
+    try {
+        const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
+        await connection.openBox('INBOX');
+        await connection.addFlags(uid, '\\Answered');
+        connection.end();
+        res.json({ success: true });
+    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+// --- 收信 API ---
+app.post('/api/emails', async (req, res) => {
+    const { user, pass, imapHost } = req.body;
+    try {
+        const connection = await imaps.connect({ imap: { user, password: pass, host: imapHost || 'imap.gmail.com', port: 993, tls: true, authTimeout: 8000 } });
+        await connection.openBox('INBOX');
+        const messages = await connection.search(['ALL'], { bodies: ['HEADER', 'TEXT', ''], markSeen: false, results: [{ limit: 15 }] });
         let parsedEmails = [];
 
         for (let item of messages) {
             const all = item.parts.find(part => part.which === '');
-            if (!all) continue;
-            
             const id = item.attributes.uid;
             const parsed = await simpleParser("Imap-Id: "+id+"\r\n" + all.body);
             const senderEmail = parsed.from && parsed.from.value.length > 0 ? parsed.from.value[0].address : '未知寄件者';
-
-            let attachments = [];
-            if (parsed.attachments && parsed.attachments.length > 0) {
-                for (let att of parsed.attachments) {
-                    if (att.size > 3 * 1024 * 1024) {
-                        attachments.push({ filename: att.filename, contentType: att.contentType, size: att.size, error: true });
-                    } else if (att.content) {
-                        attachments.push({
-                            filename: att.filename,
-                            contentType: att.contentType,
-                            size: att.size,
-                            content: att.content.toString('base64')
-                        });
-                    }
-                }
-            }
-
+            
             parsedEmails.push({
                 id: id,
                 subject: parsed.subject || '(無主旨)',
@@ -272,28 +131,13 @@ app.post('/api/emails', async (req, res) => {
                 bodySnippet: parsed.text ? parsed.text.substring(0, 50).replace(/\n/g, ' ') : '',
                 timestamp: parsed.date ? parsed.date.getTime() : Date.now(),
                 read: item.attributes.flags.includes('\\Seen'),
-                replied: item.attributes.flags.includes('\\Answered'),
-                attachments: attachments
+                replied: item.attributes.flags.includes('\\Answered') // 取得是否已回信的標籤
             });
         }
-        
+        connection.end();
         parsedEmails.sort((a, b) => b.timestamp - a.timestamp);
-        res.json({ success: true, emails: parsedEmails, total: totalMessages });
-
-    } catch (error) { 
-        console.error("Fetch Error:", error);
-        res.status(500).json({ success: false, error: error.message }); 
-    } finally {
-        if (connection) connection.end();
-    }
+        res.json({ success: true, emails: parsedEmails });
+    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
 module.exports = app;
-
-module.exports.config = {
-    api: {
-        bodyParser: {
-            sizeLimit: '10mb',
-        },
-    },
-};
