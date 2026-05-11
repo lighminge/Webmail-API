@@ -132,6 +132,39 @@ app.post('/api/mark-answered', async (req, res) => {
     }
 });
 
+// --- reCAPTCHA v3 後端真實驗證 API ---
+app.post('/api/verify-recaptcha', async (req, res) => {
+    const { token, action } = req.body;
+    // 您的專屬 Google reCAPTCHA v3 秘鑰 (請保密，勿放於前端)
+    const secretKey = '6LfZK-QsAAAAAMHUdBQggSvq2QkM7bqhHzbwcPT-';
+
+    if (!token) {
+        return res.status(400).json({ success: false, error: "未提供驗證 Token" });
+    }
+
+    try {
+        // 向 Google 驗證伺服器發送確認請求
+        const response = await fetch(`https://www.google.com/recaptcha/api/siteverify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: `secret=${secretKey}&response=${token}`
+        });
+
+        const data = await response.json();
+        
+        // 驗證成功且分數 >= 0.5 (代表為人類行為)，且動作名稱一致
+        if (data.success && data.score >= 0.5 && data.action === action) {
+            res.json({ success: true, score: data.score });
+        } else {
+            console.warn("reCAPTCHA 未通過:", data);
+            res.json({ success: false, error: "判定為機器人或驗證失敗", details: data });
+        }
+    } catch (error) {
+        console.error("reCAPTCHA 伺服器通訊錯誤:", error);
+        res.status(500).json({ success: false, error: "伺服器驗證通訊異常" });
+    }
+});
+
 // --- 收信 API (支援未讀篩選) ---
 app.post('/api/emails', async (req, res) => {
     const { user, pass, imapHost, page = 1, limit = 30, filter = 'all' } = req.body;
